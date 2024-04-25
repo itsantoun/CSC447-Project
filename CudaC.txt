@@ -1,0 +1,214 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <math.h>
+#include <cuda_runtime.h>
+
+#define MAXCHAR 25
+
+// Structure for a cluster
+typedef struct {
+    double* assigned_x;
+    double* assigned_y;
+    int count;
+} cluster;
+
+__global__ void assign_points_to_clusters(double* points_x, double* points_y, double* centroids_x, double* centroids_y, int* cluster_assignments, int num_points, int num_centroids) {
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (tid < num_points) {
+        int nearest_cluster = 0;
+        double min_distance = sqrt(pow(points_x[tid] - centroids_x[0], 2) + pow(points_y[tid] - centroids_y[0], 2));
+
+        for (int j = 1; j < num_centroids; j++) {
+            double temp_dist = sqrt(pow(points_x[tid] - centroids_x[j], 2) + pow(points_y[tid] - centroids_y[j], 2));
+
+            if (temp_dist < min_distance) {
+                min_distance = temp_dist;
+                nearest_cluster = j;
+            }
+        }
+
+        cluster_assignments[tid] = nearest_cluster;
+    }
+}
+
+__global__ void update_centroids(double* points_x, double* points_y, double* centroids_x, double* centroids_y, int* cluster_assignments, int num_points, int num_centroids) {
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (tid < num_centroids) {
+        double sum_x = 0, sum_y = 0;
+        int count = 0;
+
+        for (int i = 0; i < num_points; i++) {
+            if (cluster_assignments[i] == tid) {
+                sum_x += points_x[i];
+                sum_y += points_y[i];
+                count++;
+            }
+        }
+
+        double new_centroid_x = (count > 0) ? sum_x / count : centroids_x[tid];
+        double new_centroid_y = (count > 0) ? sum_y / count : centroids_y[tid];
+
+        centroids_x[tid] = new_centroid_x;
+        centroids_y[tid] = new_centroid_y;
+    }
+}
+
+int main(int argc, char* argv[]) {
+    // Catch console errors
+    if (argc != 8) {
+        printf("USE LIKE THIS: kmeans_clustering_cuda n_points points.csv n_centroids centroids.csv output.csv time.csv num_threads\n");
+        exit(-1);
+    }
+
+    // Read command-line arguments
+    int num_points = strtol(argv[1], NULL, 10);
+    FILE* pointsFile = fopen(argv[2], "r");
+    int num_centroids = strtol(argv[3], NULL, 10);
+    FILE* centroidsFile = fopen(argv[4], "r");
+    FILE* outputFile = fopen(argv[5], "w");
+    FILE* timeFile = fopen(argv[6], "w");
+    int num_threads = strtol(argv[7], NULL, 10);
+
+    // Initialize arrays for x and y coordinates of points
+    double* points_x = (double*)malloc(num_points * sizeof(double));
+    double* points_y = (double*)malloc(num_points * sizeof(double));
+
+    // Initialize arrays for x and y coordinates of centroids
+    double* centroids_x = (double*)malloc(num_centroids * sizeof(double));
+    double* centroids_y = (double*)malloc(num_centroids * sizeof(double));
+
+    // Read input points file and store data in points arrays
+    int k = 0;
+    char str[MAXCHAR];
+    while (fgets(str, MAXCHAR, pointsFile) != NULL) {
+        sscanf(str, "%lf,%lf", &(points_x[k]), &(points_y[k]));
+        k++;
+    }
+    fclose(pointsFile);
+
+    // Read centroids file and store initial centroids location in centroids arrays
+    k = 0;
+    while (fgets(str, MAXCHAR, centroidsFile) != NULL) {
+        sscanf(str, "%lf,%lf", &(centroids_x[k]), &(centroids_y[k]));
+        k++;
+    }
+    fclose(centroidsFile);
+
+    // Start measuring time using CUDA events
+    cudaEvent_t start, stop;
+    cudaEventCreate(&start);
+    cudaEventCreate(&stop);
+
+    // CUDA memory allocation
+    double *d_points_x, *d_points_y, *d_centroids_x, *d_centroids_y;
+    int *d_cluster_assignments;
+
+    cudaMalloc((void**)&d_points_x, num_points * sizeof(double));
+    cudaMalloc((void**)&d_points_y, num_points * sizeof(double));
+    cudaMalloc((void**)&d_centroids_x, num_centroids * sizeof(double));
+    cudaMalloc((void**)&d_centroids_y, num_centroids * sizeof(double));
+    cudaMalloc((void**)&d_cluster_assignments, num_points * sizeof(int));
+
+    // CUDA memory copy
+    cudaMemcpy(d_points_x, points_x, num_points * sizeof(double), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_points_y, points_y, num_points * sizeof(double), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_centroids_x, centroids_x, num_centroids * sizeof(double), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_centroids_y, centroids_y, num_centroids * sizeof(double), cudaMemcpyHostToDevice);
+
+    // Set the threshold level and initialize initial avg moving distance as > threshold
+    double THRESHOLD = 1.0;
+    double avg_moving_distance = 2.0;
+
+    // Create array of clusters
+    cluster* clu = (cluster*)malloc(num_centroids * sizeof(cluster));
+
+    // Initialize clusters
+    for (int i = 0; i < num_centroids; i++) {
+        clu[i].assigned_x = (double*)malloc(num_points * sizeof(double));
+        clu[i].assigned_y = (double*)malloc(num_points * sizeof(double));
+        clu[i].count = 0;
+    }
+
+    // Record start event
+    cudaEventRecord(start);
+
+    // While not converged
+    while (avg_moving_distance > THRESHOLD) {
+        // Assign each point to its nearest centroid
+        assign_points_to_clusters<<<(num_points + 255) / 256, 256>>>(d_points_x, d_points_y, d_centroids_x, d_centroids_y, d_cluster_assignments, num_points, num_centroids);
+
+        cudaDeviceSynchronize();
+
+        double sum_moving_distance = 0;
+
+        // Update the location of centroids
+        update_centroids<<<(num_centroids + 255) / 256, 256>>>(d_points_x, d_points_y, d_centroids_x, d_centroids_y, d_cluster_assignments, num_points, num_centroids);
+
+        cudaDeviceSynchronize();
+
+        // Copy data back from device to host
+        cudaMemcpy(centroids_x, d_centroids_x, num_centroids * sizeof(double), cudaMemcpyDeviceToHost);
+        cudaMemcpy(centroids_y, d_centroids_y, num_centroids * sizeof(double), cudaMemcpyDeviceToHost);
+
+        // Compute moving distance of centroids
+        for (int i = 0; i < num_centroids; i++) {
+            double moving_distance = sqrt(pow(centroids_x[i] - clu[i].assigned_x[0], 2) + pow(centroids_y[i] - clu[i].assigned_y[0], 2));
+            sum_moving_distance += moving_distance;
+        }
+
+        avg_moving_distance = sum_moving_distance / num_centroids;
+    }
+
+    // Record stop event
+    cudaEventRecord(stop);
+    cudaEventSynchronize(stop);
+
+    // Print time (write to output time file)
+    float milliseconds = 0;
+    cudaEventElapsedTime(&milliseconds, start, stop);
+    fprintf(timeFile, "%f", milliseconds);
+ // Write the final centroids positions to output file
+    for (int c = 0; c < num_centroids; ++c) {
+    printf( "%f, %f", centroids_x[c], centroids_y[c]);
+        
+    }
+    // Write the final centroids positions to output file
+    for (int c = 0; c < num_centroids; ++c) {
+        fprintf(outputFile, "%f, %f", centroids_x[c], centroids_y[c]);
+        if (c != num_centroids - 1) fprintf(outputFile, "\n");
+    }
+
+    // Cleanup host memory
+    free(points_x);
+    free(points_y);
+    free(centroids_x);
+    free(centroids_y);
+
+    // Cleanup device memory
+    cudaFree(d_points_x);
+    cudaFree(d_points_y);
+    cudaFree(d_centroids_x);
+    cudaFree(d_centroids_y);
+    cudaFree(d_cluster_assignments);
+
+    
+    // Cleanup clusters
+    for (int i = 0; i < num_centroids; i++) {
+        free(clu[i].assigned_x);
+        free(clu[i].assigned_y);
+    }
+    free(clu);
+
+    // Cleanup CUDA events
+    cudaEventDestroy(start);
+    cudaEventDestroy(stop);
+
+    // Close output files
+    fclose(outputFile);
+    fclose(timeFile);
+
+    return 0;
+}

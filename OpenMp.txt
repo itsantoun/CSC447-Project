@@ -1,0 +1,184 @@
+#include <stdio.h>
+#include <stdlib.h> 
+#include <string.h>
+#include <omp.h>
+#include <math.h> 
+#include <float.h>
+
+#define MAXCHAR 25
+#define DEBUG   1
+
+// Structure for a cluster
+typedef struct {
+    double* assigned_x;
+    double* assigned_y;
+    int count;
+} cluster;
+
+int main(int argc, char* argv[]) {
+    // Catch console errors
+    if (argc != 8) {
+        printf("USE LIKE THIS: kmeans_clustering n_points points.csv n_centroids centroids.csv output.csv time.csv num_threads\n");
+        exit(-1);
+    }
+
+    // Read number of points from command line and open input points file
+    int num_points = strtol(argv[1], NULL, 10);
+    FILE* pointsFile = fopen(argv[2], "r");
+    if (pointsFile == NULL) {
+        printf("Could not open file %s", argv[2]);
+        exit(-2);
+    }
+
+    // Read number of centroids from command line and open input centroids file
+    int num_centroids = strtol(argv[3], NULL, 10);
+    FILE* centroidsFile = fopen(argv[4], "r");
+    if (centroidsFile == NULL) {
+        printf("Could not open file %s", argv[4]);
+        fclose(pointsFile);
+        exit(-3);
+    }
+
+    // Initialize output files
+    FILE* outputFile = fopen(argv[5], "w");
+    FILE* timeFile = fopen(argv[6], "w");
+
+    // Get the number of threads from command line
+    int thread_count = strtol(argv[7], NULL, 10);
+
+    // Initilize arrays for x and y coordinates of points
+    double* points_x = malloc(num_points * sizeof(double));
+    double* points_y = malloc(num_points * sizeof(double));
+
+    // Initialize arrays for x and y coordinates of centroids
+    double* centroids_x = malloc(num_centroids * sizeof(double));
+    double* centroids_y = malloc(num_centroids * sizeof(double));
+
+    char str[MAXCHAR];
+
+    // Read input points file and store data in points arrays
+    int k = 0;
+    while (fgets(str, MAXCHAR, pointsFile) != NULL) {
+        sscanf(str, "%lf,%lf", &(points_x[k]), &(points_y[k]));
+        k++;
+    }
+    fclose(pointsFile);
+
+    // Read centroids file and store initial centroids location in centroids arrays
+    k = 0;
+    while (fgets(str, MAXCHAR, centroidsFile) != NULL) {
+        sscanf(str, "%lf,%lf", &(centroids_x[k]), &(centroids_y[k]));;
+        k++;
+    }
+    fclose(centroidsFile);
+
+    // Start measuring time
+    double start = omp_get_wtime();
+
+    // Set the threshold level and initialize initial avg moving distance as > threshold
+    double THRESHOLD = 1.0;
+    double avg_moving_distance = 2.0;
+
+    // Create array of clusters
+    cluster* clu = (cluster*)malloc(num_centroids * sizeof(cluster));
+
+    // Initialize clusters
+    for (int i = 0; i < num_centroids; i++)
+    {
+        clu[i].assigned_x = (double*)malloc(num_points * sizeof(double));
+        clu[i].assigned_y = (double*)malloc(num_points * sizeof(double));
+        clu[i].count = 0;
+    }
+
+    // While not converged
+    while (avg_moving_distance > THRESHOLD)
+    {
+        // Assign each point to its nearest centroid
+#       pragma omp parallel for num_threads(thread_count)
+        for (int i = 0; i < num_points; i++)
+        {
+            int nearest_cluster = 0;
+
+            // Initial min distance is the eucledian distance between the point and centroid 0
+            double min_distance = sqrt(pow(points_x[i] - centroids_x[0], 2) + pow(points_y[i] - centroids_y[0], 2));
+
+            // Calculate the distance between the point and all other centroids
+            for (int j = 1; j < num_centroids; j++)
+            {
+                // Calculate eucledian distance
+                double temp_dist = sqrt(pow(points_x[i] - centroids_x[j], 2) + pow(points_y[i] - centroids_y[j], 2));
+
+                if (temp_dist < min_distance)
+                {
+                    // update the minimum distance and nearest cluster
+                    min_distance = temp_dist;
+                    nearest_cluster = j;
+                }
+            }
+            // Assign the point to its nearest cluster
+#           pragma omp critical
+            {
+                clu[nearest_cluster].assigned_x[clu[nearest_cluster].count] = points_x[i];
+                clu[nearest_cluster].assigned_y[clu[nearest_cluster].count] = points_y[i];
+                clu[nearest_cluster].count++;
+            }
+        }
+
+        double sum_moving_distance = 0;
+
+        // Update the location of centroids
+#       pragma omp parallel for num_threads(thread_count) \
+            reduction(+: sum_moving_distance)
+        for (int i = 0; i < num_centroids; i++)
+        {
+            double sum_x = 0, sum_y = 0;
+            double new_centroid_x, new_centroid_y;
+
+            // Compute new centroid location
+            // Sum x and y coordiates of all assigned points and divide by number of point
+            for (int j = 0; j < clu[i].count; j++)
+            {               
+                sum_x += clu[i].assigned_x[j];
+                sum_y += clu[i].assigned_y[j];
+            }
+            new_centroid_x = sum_x / clu[i].count;
+            new_centroid_y = sum_y / clu[i].count;
+
+            // Compute moving distance of this centroid
+            double moving_distance = sqrt(pow(centroids_x[i] - new_centroid_x, 2) + pow(centroids_y[i] - new_centroid_y, 2));
+            sum_moving_distance += moving_distance;
+
+            // Update the centroid locations
+            centroids_x[i] = new_centroid_x;
+            centroids_y[i] = new_centroid_y;
+            clu[i].count = 0;
+        }
+        avg_moving_distance = sum_moving_distance / num_centroids;
+    }
+
+    // Stop measuring time
+    double end = omp_get_wtime();
+  
+    // Print time (write to output time file)
+    double time_passed = end - start;
+    fprintf(timeFile, "%f", time_passed);
+
+    // Write the final centroids positions to output file
+    for (int c = 0; c < num_centroids; ++c) {
+        fprintf(outputFile, "%f, %f", centroids_x[c], centroids_y[c]);
+        if (c != num_centroids - 1) fprintf(outputFile, "\n");
+    }
+
+    // Close output files
+    fclose(outputFile);
+    fclose(timeFile);
+
+    // Cleanup
+    free(points_x);
+    free(points_y);
+    free(centroids_x);
+    free(centroids_y);
+    free(clu);
+
+    return 0;
+}

@@ -1,0 +1,249 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <mpi.h>
+#include <math.h>
+#include <float.h>
+
+#define MAXCHAR 25
+#define DEBUG   1
+
+// Structure for a cluster
+typedef struct {
+    double* assigned_x;
+    double* assigned_y;
+    int count;
+} cluster;
+
+int main(int argc, char* argv[]) {
+    // Initialize MPI
+    MPI_Init(&argc, &argv);
+
+    // Get the rank and size of the MPI communicator
+    int rank, size;
+    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+    MPI_Comm_size(MPI_COMM_WORLD, &size);
+
+    // Catch console errors
+    if (argc != 8) {
+        if (rank == 0) {
+            printf("USE LIKE THIS: mpiexec -n <num_processes> kmeans_clustering n_points points.csv n_centroids centroids.csv output.csv time.csv num_threads\n");
+        }
+        MPI_Finalize();
+        exit(-1);
+    }
+
+    // Read number of points from command line and open input points file
+    int num_points = strtol(argv[1], NULL, 10);
+    FILE* pointsFile = fopen(argv[2], "r");
+    if (pointsFile == NULL) {
+        printf("Could not open file %s", argv[2]);
+        MPI_Finalize();
+        exit(-2);
+    }
+
+    // Read number of centroids from command line and open input centroids file
+    int num_centroids = strtol(argv[3], NULL, 10);
+    FILE* centroidsFile = fopen(argv[4], "r");
+    if (centroidsFile == NULL) {
+        printf("Could not open file %s", argv[4]);
+        fclose(pointsFile);
+        MPI_Finalize();
+        exit(-3);
+    }
+
+    // Initialize output files
+    FILE* outputFile = fopen(argv[5], "w");
+    FILE* timeFile = fopen(argv[6], "w");
+
+    // Get the number of threads from command line
+    int thread_count = strtol(argv[7], NULL, 10);
+
+    // Calculate the number of points to be processed by each process
+    int points_per_process = num_points / size;
+    int extra_points = num_points % size;
+
+    // Calculate the starting and ending indices of the points for each process
+    int start_index = rank * points_per_process + (rank < extra_points ? rank : extra_points);
+    int end_index = start_index + points_per_process + (rank < extra_points ? 1 : 0);
+
+    // Calculate the number of centroids to be processed by each process
+    int centroids_per_process = num_centroids / size;
+    int extra_centroids = num_centroids % size;
+
+    // Calculate the starting and ending indices of the centroids for each process
+    int centroids_start_index = rank * centroids_per_process + (rank < extra_centroids ? rank : extra_centroids);
+    int centroids_end_index = centroids_start_index + centroids_per_process + (rank < extra_centroids ? 1 : 0);
+
+    // Initilize arrays for x and y coordinates of points
+    double* points_x = (double*)malloc((end_index - start_index) * sizeof(double));
+    double* points_y = (double*)malloc((end_index - start_index) * sizeof(double));
+
+    // Initialize arrays for x and y coordinates of centroids
+    double* centroids_x = (double*)malloc((centroids_end_index - centroids_start_index) * sizeof(double));
+    double* centroids_y = (double*)malloc((centroids_end_index - centroids_start_index) * sizeof(double));
+
+    // Scatter points and centroids to all processes
+    MPI_Scatter(points_x, points_per_process, MPI_DOUBLE, points_x, points_per_process, MPI_DOUBLE, 0, MPI_COMM_WORLD);
+    MPI_Scatter(points_y, points_per_process, MPI_DOUBLE, points_y, points_per_process, MPI_DOUBLE, 0, MPI_COMM_WORLD);
+
+    MPI_Scatter(centroids_x, centroids_per_process, MPI_DOUBLE, centroids_x, centroids_per_process, MPI_DOUBLE, 0, MPI_COMM_WORLD);
+    MPI_Scatter(centroids_y, centroids_per_process, MPI_DOUBLE, centroids_y, centroids_per_process, MPI_DOUBLE, 0, MPI_COMM_WORLD);
+
+    char str[MAXCHAR];
+
+    // Start measuring time
+    double start = MPI_Wtime();
+
+    // Set the threshold level and initialize initial avg moving distance as > threshold
+    double THRESHOLD = 1.0;
+    double avg_moving_distance = 2.0;
+
+    // Create array of clusters
+    cluster* clu = (cluster*)malloc((centroids_end_index - centroids_start_index) * sizeof(cluster));
+
+    // Initialize clusters
+    for (int i = 0; i < (centroids_end_index - centroids_start_index); i++) {
+        clu[i].assigned_x = (double*)malloc(num_points * sizeof(double));
+        clu[i].assigned_y = (double*)malloc(num_points * sizeof(double));
+        clu[i].count = 0;
+    }
+
+    // While not converged
+    while (avg_moving_distance > THRESHOLD) {
+        // Assign each point to its nearest centroid
+        for (int i = start_index; i < end_index; i++) {
+            int nearest_cluster = 0;
+
+            // Initial min distance is the Euclidean distance between the point and centroid 0
+            double min_distance = sqrt(pow(points_x[i - start_index] - centroids_x[0], 2) + pow(points_y[i - start_index] - centroids_y[0], 2));
+
+            // Calculate the distance between the point and all other centroids
+            for (int j = 1; j < num_centroids; j++) {
+                // Calculate Euclidean distance
+                double temp_dist = sqrt(pow(points_x[i - start_index] - centroids_x[j], 2) + pow(points_y[i - start_index] - centroids_y[j], 2));
+
+                if (temp_dist < min_distance) {
+                    // update the minimum distance and nearest cluster
+                    min_distance = temp_dist;
+                    nearest_cluster = j;
+                }
+            }
+
+            // Assign the point to its nearest cluster
+            clu[nearest_cluster - centroids_start_index].assigned_x[clu[nearest_cluster - centroids_start_index].count] = points_x[i - start_index];
+            clu[nearest_cluster - centroids_start_index].assigned_y[clu[nearest_cluster - centroids_start_index].count] = points_y[i - start_index];
+            clu[nearest_cluster - centroids_start_index].count++;
+        }
+
+        double sum_moving_distance = 0;
+
+        // Gather the assigned points count from all processes
+        int* assigned_counts = (int*)malloc(size * sizeof(int));
+        MPI_Allgather(&(clu[0].count), 1, MPI_INT, assigned_counts, 1, MPI_INT, MPI_COMM_WORLD);
+
+        // Calculate the displacements for the assigned points in each process
+        int* displacements = (int*)malloc(size * sizeof(int));
+        displacements[0] = 0;
+        for (int i = 1; i < size; i++) {
+            displacements[i] = displacements[i - 1] + assigned_counts[i - 1];
+        }
+
+        // Gather all assigned points for each cluster
+        int* assigned_points_counts = (int*)malloc(size * sizeof(int));
+        for (int i = 0; i < size; i++) {
+            assigned_points_counts[i] = assigned_counts[i] * 2;
+        }
+        double* all_assigned_points_x = (double*)malloc(sum(assigned_points_counts) * sizeof(double));
+        double* all_assigned_points_y = (double*)malloc(sum(assigned_points_counts) * sizeof(double));
+        MPI_Allgatherv(&(clu[0].assigned_x[0]), clu[0].count, MPI_DOUBLE, all_assigned_points_x, assigned_counts, displacements, MPI_DOUBLE, MPI_COMM_WORLD);
+        MPI_Allgatherv(&(clu[0].assigned_y[0]), clu[0].count, MPI_DOUBLE, all_assigned_points_y, assigned_counts, displacements, MPI_DOUBLE, MPI_COMM_WORLD);
+
+        // Update the location of centroids
+        double* new_centroids_x = (double*)malloc((centroids_end_index - centroids_start_index) * sizeof(double));
+        double* new_centroids_y = (double*)malloc((centroids_end_index - centroids_start_index) * sizeof(double));
+
+        for (int i = 0; i < (centroids_end_index - centroids_start_index); i++) {
+            double sum_x = 0, sum_y = 0;
+            double new_centroid_x, new_centroid_y;
+
+            // Compute new centroid location
+            for (int j = 0; j < assigned_points_counts[i]; j += 2) {
+                sum_x += all_assigned_points_x[j];
+                sum_y += all_assigned_points_y[j + 1];
+            }
+            new_centroid_x = sum_x / assigned_counts[i];
+            new_centroid_y = sum_y / assigned_counts[i];
+
+            // Compute moving distance of this centroid
+            double moving_distance = sqrt(pow(centroids_x[i] - new_centroid_x, 2) + pow(centroids_y[i] - new_centroid_y, 2));
+            sum_moving_distance += moving_distance;
+
+            // Update the centroid locations
+            new_centroids_x[i] = new_centroid_x;
+            new_centroids_y[i] = new_centroid_y;
+        }
+
+        // Gather the new centroids from all processes
+        double* all_new_centroids_x = (double*)malloc(num_centroids * sizeof(double));
+        double* all_new_centroids_y = (double*)malloc(num_centroids * sizeof(double));
+        MPI_Allgatherv(new_centroids_x, (centroids_end_index - centroids_start_index), MPI_DOUBLE, all_new_centroids_x, assigned_counts, displacements, MPI_DOUBLE, MPI_COMM_WORLD);
+        MPI_Allgatherv(new_centroids_y, (centroids_end_index - centroids_start_index), MPI_DOUBLE, all_new_centroids_y, assigned_counts, displacements, MPI_DOUBLE, MPI_COMM_WORLD);
+
+        // Update the local centroids
+        for (int i = 0; i < (centroids_end_index - centroids_start_index); i++) {
+            centroids_x[i] = all_new_centroids_x[i + centroids_start_index];
+            centroids_y[i] = all_new_centroids_y[i + centroids_start_index];
+        }
+
+        // Calculate the average moving distance across all processes
+        double total_moving_distance = 0.0;
+        MPI_Allreduce(&sum_moving_distance, &total_moving_distance, 1, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
+        avg_moving_distance = total_moving_distance / num_centroids;
+    }
+
+    // Stop measuring time
+    double end = MPI_Wtime();
+
+    // Print time (write to output time file)
+    double time_passed = end - start;
+    if (rank == 0) {
+        fprintf(timeFile, "%f", time_passed);
+    }
+
+    // Gather all the final centroids from all processes to rank 0
+    double* all_centroids_x = NULL;
+    double* all_centroids_y = NULL;
+    if (rank == 0) {
+        all_centroids_x = (double*)malloc(num_centroids * sizeof(double));
+        all_centroids_y = (double*)malloc(num_centroids * sizeof(double));
+    }
+    MPI_Gather(centroids_x, (centroids_end_index - centroids_start_index), MPI_DOUBLE, all_centroids_x, (centroids_end_index - centroids_start_index), MPI_DOUBLE, 0, MPI_COMM_WORLD);
+    MPI_Gather(centroids_y, (centroids_end_index - centroids_start_index), MPI_DOUBLE, all_centroids_y, (centroids_end_index - centroids_start_index), MPI_DOUBLE, 0, MPI_COMM_WORLD);
+
+    // Write the final centroids positions to output file from rank 0
+    if (rank == 0) {
+        for (int c = 0; c < num_centroids; ++c) {
+            fprintf(outputFile, "%f, %f", all_centroids_x[c], all_centroids_y[c]);
+            if (c != num_centroids - 1) fprintf(outputFile, "\n");
+        }
+    }
+
+    // Close output files
+    fclose(outputFile);
+    if (rank == 0) {
+        fclose(timeFile);
+    }
+
+    // Cleanup
+    free(points_x);
+    free(points_y);
+    free(centroids_x);
+    free(centroids_y);
+    free(clu);
+
+    // Finalize MPI
+    MPI_Finalize();
+
+    return 0;
+}
